@@ -1,6 +1,5 @@
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 from langgraph.types import Checkpointer
 from langgraph.graph import START, END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -26,6 +25,7 @@ AGENT_NAME = "pandas_data_analyst"
 class PandasDataAnalyst(BaseAgent):
     """
     PandasDataAnalyst is a multi-agent class that combines data wrangling and visualization capabilities.
+    The orchestrator LLM uses tool-calling to invoke sub-agents rather than hard-coded routing.
 
     Parameters:
     -----------
@@ -277,6 +277,8 @@ def make_pandas_data_analyst(
 ):
     """
     Creates a multi-agent system that wrangles data and optionally visualizes it.
+    The orchestrator LLM uses tool-calling to decide which sub-agents to invoke,
+    replacing hard-coded routing logic.
 
     Parameters:
     -----------
@@ -295,37 +297,42 @@ def make_pandas_data_analyst(
 
     llm = model
 
-    routing_preprocessor_prompt = PromptTemplate(
-        template="""
-        You are an expert in routing decisions for a Pandas Data Manipulation Wrangling Agent, a Charting Visualization Agent, and a Pandas Table Agent. Your job is to tell the agents which actions to perform and determine the correct routing for the incoming user question:
-        
-        1. Determine what the correct format for a Users Question should be for use with a Pandas Data Wrangling Agent based on the incoming user question. Anything related to data wrangling and manipulation should be passed along. Anything related to data analysis can be handled by the Pandas Agent. Anything that uses Pandas can be passed along. Tables can be returned from this agent. Don't pass along anything about plotting or visualization.
-        2. Determine whether or not a chart should be generated or a table should be returned based on the users question.
-        3. If a chart is requested, determine the correct format of a Users Question should be used with a Data Visualization Agent. Anything related to plotting and visualization should be passed along.
-        
-        Use the following criteria on how to route the the initial user question:
-        
-        From the incoming user question, remove any details about the format of the final response as either a Chart or Table and return only the important part of the incoming user question that is relevant for the Pandas Data Wrangling and Transformation agent. This will be the 'user_instructions_data_wrangling'. If 'None' is found, return the original user question.
-        
-        Next, determine if the user would like a data visualization ('chart') or a 'table' returned with the results of the Data Wrangling Agent. If unknown, not specified or 'None' is found, then select 'table'.  
-        
-        If a 'chart' is requested, return the 'user_instructions_data_visualization'. If 'None' is found, return None.
-        
-        Return JSON with 'user_instructions_data_wrangling', 'user_instructions_data_visualization' and 'routing_preprocessor_decision'.
-        
-        INITIAL_USER_QUESTION: {user_instructions}
-        """,
-        input_variables=["user_instructions"],
-    )
+    # --- Tool definitions (schema only; actual invocation happens in execute_tools) ---
 
-    routing_preprocessor = routing_preprocessor_prompt | llm | JsonOutputParser()
+    @tool
+    def data_wrangling_tool(user_instructions: str) -> str:
+        """
+        Wrangle, transform, filter, aggregate, or reshape pandas data based on user instructions.
+        Always call this tool first before any visualization.
+        """
+        return user_instructions
+
+    @tool
+    def data_visualization_tool(user_instructions: str) -> str:
+        """
+        Create a Plotly chart or visualization based on user instructions.
+        Only call this tool when the user explicitly requests a chart or plot.
+        """
+        return user_instructions
+
+    tools = [data_wrangling_tool, data_visualization_tool]
+    llm_with_tools = llm.bind_tools(tools)
+
+    ORCHESTRATOR_SYSTEM_PROMPT = (
+        "You are a pandas data analyst orchestrator. You have two tools:\n"
+        "1. `data_wrangling_tool`: Transforms, filters, aggregates, or reshapes data. "
+        "Always call this first with the data manipulation part of the user's request.\n"
+        "2. `data_visualization_tool`: Creates a Plotly chart. "
+        "Call this only if the user explicitly asks for a chart or visualization.\n\n"
+        "Rules:\n"
+        "- Always call `data_wrangling_tool` exactly once.\n"
+        "- Call `data_visualization_tool` at most once, and only if a chart is requested.\n"
+        "- After all tool calls are complete, provide a brief summary of what was done."
+    )
 
     class PrimaryState(TypedDict):
         messages: Annotated[Sequence[BaseMessage], add_messages]
         user_instructions: str
-        user_instructions_data_wrangling: str
-        user_instructions_data_visualization: str
-        routing_preprocessor_decision: str
         data_raw: Union[dict, list]
         data_wrangled: dict
         data_wrangler_function: str
@@ -339,19 +346,22 @@ def make_pandas_data_analyst(
         print("---PANDAS DATA ANALYST---")
         print("*************************")
         print("---PREPARE MESSAGES---")
-        msgs = state.get("messages", [])
+        msgs = list(state.get("messages", []))
         ui = state.get("user_instructions")
-        if not msgs:
-            system_hint = (
-                "You are a pandas data analyst orchestrator. Route the user's question to data wrangling "
-                "and optional visualization. Prefer tables unless the user clearly requests a chart."
-            )
-            msgs = [("system", system_hint), ("user", ui)]
+
+        # Inject system prompt if not already present
+        if not any(isinstance(m, SystemMessage) for m in msgs):
+            msgs = [SystemMessage(content=ORCHESTRATOR_SYSTEM_PROMPT)] + msgs
+
+        if not msgs or (len(msgs) == 1 and isinstance(msgs[0], SystemMessage)):
+            msgs.append(HumanMessage(content=ui))
+
         if not ui:
             for msg in reversed(msgs):
                 if getattr(msg, "type", None) == "human" or getattr(msg, "role", None) == "user":
                     ui = msg.content
                     break
+
         normalized = []
         for msg in msgs:
             if isinstance(msg, BaseMessage):
@@ -368,86 +378,104 @@ def make_pandas_data_analyst(
                     normalized.append(HumanMessage(content=str(content)))
             else:
                 normalized.append(HumanMessage(content=str(msg)))
+
         return {"messages": normalized, "user_instructions": ui}
 
-    def preprocess_routing(state: PrimaryState):
-        print("---PREPROCESS ROUTER---")
-        question = state.get("user_instructions")
+    def orchestrator_node(state: PrimaryState):
+        print("---ORCHESTRATOR (LLM with Tools)---")
+        messages = state.get("messages", [])
+        response = llm_with_tools.invoke(messages)
+        return {"messages": [response]}
 
-        try:
-            response = routing_preprocessor.invoke({"user_instructions": question})
-        except Exception:
-            response = {
-                "user_instructions_data_wrangling": question,
-                "user_instructions_data_visualization": None,
-                "routing_preprocessor_decision": "table",
-            }
+    def execute_tools(state: PrimaryState):
+        print("---EXECUTE TOOLS---")
+        messages = state.get("messages", [])
+        last_message = messages[-1]
 
-        return {
-            "user_instructions_data_wrangling": response.get(
-                "user_instructions_data_wrangling", question
-            ),
-            "user_instructions_data_visualization": response.get(
-                "user_instructions_data_visualization"
-            ),
-            "routing_preprocessor_decision": response.get(
-                "routing_preprocessor_decision", "table"
-            ),
-        }
+        updates = {}
+        new_messages = []
 
-    def router_chart_or_table(state: PrimaryState):
-        print("---ROUTER: CHART OR TABLE---")
-        return (
-            "chart"
-            if state.get("routing_preprocessor_decision") == "chart"
-            else "table"
-        )
+        for tool_call in last_message.tool_calls:
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
+            tool_call_id = tool_call["id"]
 
-    def invoke_data_wrangling_agent(state: PrimaryState):
-        response = data_wrangling_agent.invoke(
-            {
-                "user_instructions": state.get("user_instructions_data_wrangling"),
-                "data_raw": state.get("data_raw"),
-                "max_retries": state.get("max_retries"),
-                "retry_count": state.get("retry_count"),
-            }
-        )
+            if tool_name == "data_wrangling_tool":
+                print("---INVOKING DATA WRANGLING AGENT---")
+                response = data_wrangling_agent.invoke(
+                    {
+                        "user_instructions": tool_args.get("user_instructions"),
+                        "data_raw": state.get("data_raw"),
+                        "max_retries": state.get("max_retries"),
+                        "retry_count": state.get("retry_count"),
+                    }
+                )
+                data_wrangled = response.get("data_wrangled")
+                updates["data_wrangled"] = data_wrangled
+                updates["data_wrangler_function"] = response.get("data_wrangler_function")
+                new_messages.extend(response.get("messages", []))
 
-        return {
-            "messages": response.get("messages"),
-            "data_wrangled": response.get("data_wrangled"),
-            "data_wrangler_function": response.get("data_wrangler_function"),
-            "plotly_error": response.get("data_visualization_error"),
-        }
+                try:
+                    shape = pd.DataFrame(data_wrangled).shape if data_wrangled else None
+                    result_summary = (
+                        f"Data wrangling complete. Result shape: {shape[0]} rows x {shape[1]} cols."
+                        if shape
+                        else "Data wrangling complete."
+                    )
+                except Exception:
+                    result_summary = "Data wrangling complete."
 
-    def invoke_data_visualization_agent(state: PrimaryState):
-        data_for_viz = state.get("data_wrangled") or state.get("data_raw")
-        if data_for_viz is None:
-            return {
-                "messages": [],
-                "data_visualization_function": None,
-                "plotly_graph": None,
-                "plotly_error": "No data available for visualization; skipped.",
-            }
-        response = data_visualization_agent.invoke(
-            {
-                "user_instructions": state.get("user_instructions_data_visualization"),
-                "data_raw": data_for_viz,
-                "max_retries": state.get("max_retries"),
-                "retry_count": state.get("retry_count"),
-            }
-        )
+                new_messages.append(
+                    ToolMessage(content=result_summary, tool_call_id=tool_call_id)
+                )
 
-        return {
-            "messages": response.get("messages"),
-            "data_visualization_function": response.get("data_visualization_function"),
-            "plotly_graph": response.get("plotly_graph"),
-            "plotly_error": response.get("data_visualization_error"),
-        }
+            elif tool_name == "data_visualization_tool":
+                print("---INVOKING DATA VISUALIZATION AGENT---")
+                data_for_viz = (
+                    updates.get("data_wrangled")
+                    or state.get("data_wrangled")
+                    or state.get("data_raw")
+                )
+                if data_for_viz is None:
+                    error_msg = "No data available for visualization; skipped."
+                    updates["plotly_error"] = error_msg
+                    new_messages.append(
+                        ToolMessage(content=error_msg, tool_call_id=tool_call_id)
+                    )
+                    continue
+
+                response = data_visualization_agent.invoke(
+                    {
+                        "user_instructions": tool_args.get("user_instructions"),
+                        "data_raw": data_for_viz,
+                        "max_retries": state.get("max_retries"),
+                        "retry_count": state.get("retry_count"),
+                    }
+                )
+                updates["plotly_graph"] = response.get("plotly_graph")
+                updates["data_visualization_function"] = response.get("data_visualization_function")
+                updates["plotly_error"] = response.get("data_visualization_error")
+                new_messages.extend(response.get("messages", []))
+
+                result_summary = (
+                    "Chart created successfully."
+                    if response.get("plotly_graph")
+                    else f"Chart creation failed: {response.get('data_visualization_error', 'Unknown error')}"
+                )
+                new_messages.append(
+                    ToolMessage(content=result_summary, tool_call_id=tool_call_id)
+                )
+
+        return {"messages": new_messages, **updates}
+
+    def should_continue(state: PrimaryState):
+        last_message = state.get("messages", [])[-1]
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            return "tools"
+        return "finalize"
 
     def finalize_output(state: PrimaryState):
         print("---FINALIZE OUTPUT---")
-        route = state.get("routing_preprocessor_decision", "table")
         data_wrangled = state.get("data_wrangled")
         plot = state.get("plotly_graph")
         plot_err = state.get("plotly_error")
@@ -458,36 +486,29 @@ def make_pandas_data_analyst(
                 parts.append(f"Wrangled table shape: {df.shape[0]} rows x {df.shape[1]} cols.")
             except Exception:
                 parts.append("Wrangled data available.")
-        if route == "chart":
-            if plot:
-                parts.append("Chart created from wrangled data.")
-            elif plot_err:
-                parts.append(f"Chart not created: {plot_err}")
+        if plot:
+            parts.append("Chart created from wrangled data.")
+        elif plot_err:
+            parts.append(f"Chart not created: {plot_err}")
         summary = " ".join(parts) or "Workflow completed."
         ai_msg = AIMessage(content=summary, role="assistant")
-        msgs = state.get("messages", [])
-        msgs = msgs + [ai_msg]
-        return {"messages": msgs}
+        return {"messages": [ai_msg]}
 
     workflow = StateGraph(PrimaryState)
 
     workflow.add_node("prepare_messages", prepare_messages)
-    workflow.add_node("routing_preprocessor", preprocess_routing)
-    workflow.add_node("data_wrangling_agent", invoke_data_wrangling_agent)
-    workflow.add_node("data_visualization_agent", invoke_data_visualization_agent)
+    workflow.add_node("orchestrator", orchestrator_node)
+    workflow.add_node("tools", execute_tools)
     workflow.add_node("finalize_output", finalize_output)
 
     workflow.add_edge(START, "prepare_messages")
-    workflow.add_edge("prepare_messages", "routing_preprocessor")
-    workflow.add_edge("routing_preprocessor", "data_wrangling_agent")
-
+    workflow.add_edge("prepare_messages", "orchestrator")
     workflow.add_conditional_edges(
-        "data_wrangling_agent",
-        router_chart_or_table,
-        {"chart": "data_visualization_agent", "table": "finalize_output"},
+        "orchestrator",
+        should_continue,
+        {"tools": "tools", "finalize": "finalize_output"},
     )
-
-    workflow.add_edge("data_visualization_agent", "finalize_output")
+    workflow.add_edge("tools", "orchestrator")
     workflow.add_edge("finalize_output", END)
 
     app = workflow.compile(checkpointer=checkpointer, name=AGENT_NAME)
